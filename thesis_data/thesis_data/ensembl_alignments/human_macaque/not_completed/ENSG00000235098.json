@@ -1,0 +1,1 @@
+{"type": "cogent3.app.composable.NotCompleted", "not_completed_construction": {"args": ["FALSE", "take_named_seqs", "named seq(s) {'macaca_mulatta'} not in ['chlorocebus_sabaeus', 'microcebus_murinus', 'pan_paniscus', 'pan_troglodytes', 'homo_sapiens', 'pongo_abelii', 'gorilla_gorilla']"], "kwargs": {"source": "ENSG00000235098.fa"}}, "version": "2025.3.22a4"}
