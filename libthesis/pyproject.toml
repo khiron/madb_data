@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "libthesis"
+version = "0.1.0"
+description = "Utilities for consistent thesis figure output and PDF writing"
+authors = [
+  { name = "Richard Morris", email = "richard.morris@anu.edu.au" }
+]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+dependencies = [
+  "plotly",  # required by thesis_figure_layout
+]
+
+[project.optional-dependencies]
+dev = [
+  "build",
+  "pytest",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

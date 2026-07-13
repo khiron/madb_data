@@ -2,6 +2,7 @@ import dataclasses
 import json
 import time
 from typing import Any, Dict, Optional
+import numpy
 from tqdm import tqdm 
 import multiprocessing as mp
 import warnings
@@ -33,31 +34,30 @@ class thesis_rec:
     madb_ungapped_smith_waterman_length : int
     madb_ungapped_smith_waterman : Optional[str] = None 
     ungapped_smith_waterman_time : Optional[float] = None
-    def to_rich_dict(self) -> Dict[str, Any]:
-        result = {}
 
+    def to_rich_dict(self) -> Dict[str, Any]:
+        def make_serializable(obj):
+            # Recursive serialization
+            if hasattr(obj, "to_dict"):
+                return make_serializable(obj.to_dict())
+            elif isinstance(obj, dict):
+                return {k: make_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [make_serializable(v) for v in obj]
+            elif isinstance(obj, numpy.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, (numpy.integer, numpy.floating)):
+                return obj.item()
+            elif hasattr(obj, "moltype"):  # likely DNASequence or similar
+                return str(obj)
+            else:
+                return obj
+
+        result = {}
         for field in dataclasses.fields(self):
             name = field.name
             value = getattr(self, name)
-
-            # If the value has a .to_dict() method, call it
-            if hasattr(value, "to_dict"):
-                try:
-                    result[name] = value.to_dict()
-                except Exception as e:
-                    result[name] = f"<<Failed to convert {name} via to_dict(): {e}>>"
-            # If the value is a dict of objects with .to_dict()
-            elif isinstance(value, dict):
-                try:
-                    result[name] = {
-                        k: v.to_dict() if hasattr(v, "to_dict") else v
-                        for k, v in value.items()
-                    }
-                except Exception as e:
-                    result[name] = f"<<Failed to convert dict field {name}: {e}>>"
-            # Default: copy value directly
-            else:
-                result[name] = value
+            result[name] = make_serializable(value)
 
         try:
             json.dumps(result)
@@ -113,117 +113,63 @@ class thesis_rec:
         self.cogent3_pd = alignment.distance_matrix('pdist')[alignment.names[0], alignment.names[1]]
         return self
     
-    def align_madb(self, timeout_sec: int = 60) -> "thesis_rec":
+    def align_madb(self) -> "thesis_rec":
+        import time
+        import cogent3
+        import madb
+
         kmer_sizes = range(10, 100, 5)
 
-        def madb_worker(seqs, k, queue):
+        for k in kmer_sizes:
             try:
-                import cogent3
-                import madb
-                import time
                 start_time = time.time()
-                graph = madb.make_graph(seqs, kmer_size=k, moltype=cogent3.DNA)
-                aligned = graph.align()
+                graph = madb.make_graph(self.unaligned_seqs, kmer_size=k, moltype=cogent3.DNA)
+                aligned = graph.align(threshold=0.2)
                 elapsed = time.time() - start_time
+
                 braid_diff, braid_nucleotides, total_braids, total_bubbles, has_cycles = graph.distance(braid_bubble_counts=True)
                 longest_braid = graph.longest_braid().length
-                queue.put({
-                    "aligned": aligned.to_dict(),
-                    "time": elapsed,
-                    "graph": graph.to_dict(),
-                    "distance": braid_diff / braid_nucleotides,
-                    "bubbles": total_bubbles,
-                    "braids": total_braids,
-                    "cycles": has_cycles,
-                    "longest_braid": longest_braid
-                })
+
+                self.madb_alignment[k] = aligned.to_dict()
+                self.madb_time[k] = elapsed
+                self.madb_distance[k] = braid_diff / braid_nucleotides
+                self.madb_bubbles[k] = total_bubbles
+                self.madb_braids[k] = total_braids
+                self.madb_cycles[k] = has_cycles
+                self.madb_longest_braid_length[k] = longest_braid
+
             except Exception as e:
-                queue.put(e)
+                warnings.warn(f"MADB alignment for {self.unique_id}, k={k} failed: {e}")
+                self.madb_alignment[k] = None
+                self.madb_time[k] = None
+                self.madb_distance[k] = None
+                self.madb_bubbles[k] = None
+                self.madb_braids[k] = None
+                self.madb_cycles[k] = None
+                self.madb_longest_braid_length[k] = None
+        return self
 
-        with tqdm(total=len(kmer_sizes), desc="Aligning madb", unit="step") as pbar:
-            for k in kmer_sizes:
-                pbar.set_description(f"Aligning madb (k-mer size: {k})")
+    def calc_sw(self) -> "thesis_rec":
+        try:
+            import time
+            from cogent3 import make_unaligned_seqs, get_app
 
-                queue = mp.Queue()
-                p = mp.Process(target=madb_worker, args=(self.unaligned_seqs, k, queue))
-                p.start()
-                p.join(timeout_sec)
+            start_time = time.time()
+            unaligned = make_unaligned_seqs(data=self.unaligned_seqs, moltype="dna")
+            sw = get_app('smith_waterman', moltype="dna", insertion_penalty=10_000)
+            local_alignment = sw(unaligned)
+            elapsed_time = time.time() - start_time
+            length = len(local_alignment.seqs[0])
 
-                if p.is_alive():
-                    p.terminate()
-                    p.join()
-                    warnings.warn(f"MADB alignment for {self.unique_id}, k={k} timed out after {timeout_sec}s")
-                    self.madb_alignment[k] = None
-                    self.madb_time[k] = None
-                    self.madb_distance[k] = None
-                    self.madb_bubbles[k] = None
-                    self.madb_braids[k] = None
-                    self.madb_cycles[k] = None
-                    self.madb_longest_braid_length[k] = None
-                else:
-                    result = queue.get()
-                    if isinstance(result, Exception):
-                        warnings.warn(f"MADB alignment for {self.unique_id}, k={k} failed: {result}")
-                        self.madb_alignment[k] = None
-                        self.madb_time[k] = None
-                        self.madb_distance[k] = None
-                        self.madb_bubbles[k] = None
-                        self.madb_braids[k] = None
-                        self.madb_cycles[k] = None
-                        self.madb_longest_braid_length[k] = None
-                    else:
-                        self.madb_alignment[k] = result["graph"]
-                        self.madb_time[k] = result["time"]
-                        self.madb_score = {}  # optional: cleared, computed later
-                        self.madb_distance[k] = result["distance"]
-                        self.madb_bubbles[k] = result["bubbles"]
-                        self.madb_braids[k] = result["braids"]
-                        self.madb_cycles[k] = result["cycles"]
-                        self.madb_longest_braid_length[k] = result["longest_braid"]
+            self.madb_ungapped_smith_waterman_length = length
+            self.madb_ungapped_smith_waterman = local_alignment.to_dict()
+            self.ungapped_smith_waterman_time = elapsed_time
 
-                pbar.update(1)
-
-        return self    
-
-    def calc_sw(self, timeout_sec: int = 60) -> "thesis_rec":
-
-        def sw_worker(seqs, queue):
-            try:
-                from cogent3 import make_unaligned_seqs, get_app
-                start_time = time.time()
-                unaligned = make_unaligned_seqs(data=seqs, moltype="dna")
-                sw = get_app('smith_waterman', moltype="dna", insertion_penalty=10_000)
-                local_alignment = sw(unaligned)
-                elapsed_time = time.time() - start_time
-                length = len(local_alignment.seqs[0])
-                queue.put((length, elapsed_time,local_alignment.to_dict()))
-            except Exception as e:
-                queue.put(e)
-
-        queue = mp.Queue()
-        p = mp.Process(target=sw_worker, args=(self.unaligned_seqs, queue))
-        p.start()
-        p.join(timeout_sec)
-
-        if p.is_alive():
-            p.terminate()
-            p.join()
-            warnings.warn(f"SW alignment for {self.unique_id} timed out after {timeout_sec}s")
-            self.madb_ungapped_smith_waterman_length = None
+        except Exception as err:
+            warnings.warn(f"SW alignment failed for {self.unique_id}: {err}")
+            self.madb_ungapped_smith_waterman_length = 0
             self.madb_ungapped_smith_waterman = None
             self.ungapped_smith_waterman_time = None
-        else:
-            result = queue.get()
-            if isinstance(result, Exception):
-                warnings.warn(f"SW alignment failed for {self.unique_id}: {result}")
-                self.madb_ungapped_smith_waterman_length = 0
-                self.madb_ungapped_smith_waterman = None
-                self.ungapped_smith_waterman_time = None
-            else:
-                length, elapsed, local_alignment = result
-                self.madb_ungapped_smith_waterman_length = length
-                self.madb_ungapped_smith_waterman = local_alignment
-                self.ungapped_smith_waterman_time = elapsed
 
         return self
 
@@ -235,14 +181,15 @@ class thesis_rec:
 
         alignment = cogent3.make_aligned_seqs(self.cogent3_alignment, moltype="dna")
         self.cogent3_score = alignment.alignment_quality('sp_score')
-    
+
         kmer_sizes = range(10, 100, 5)
-        with tqdm(total=len(kmer_sizes), desc="Aligning madb", unit="step") as pbar:
-            for kmer_size in kmer_sizes:
-                # Perform pairwise alignment using MADB
-                alignment = cogent3.make_aligned_seqs(self.madb_alignment[kmer_size], moltype="dna")
-                self.madb_score[kmer_size] = alignment.alignment_quality('sp_score')
-                pbar.update(1)
+        for kmer_size in kmer_sizes:
+            madb_alignment = self.madb_alignment[str(kmer_size)]
+            if madb_alignment is None:
+                self.madb_score[str(kmer_size)] = None
+            else:
+                alignment = cogent3.make_aligned_seqs(data=madb_alignment, moltype="dna")
+                self.madb_score[str(kmer_size)] = alignment.alignment_quality('sp_score')
         return self
 
     def describe(self) -> str:
@@ -255,7 +202,7 @@ def thesis_rec_from_alignment(align: cogent3.app.typing.AlignedSeqsType)-> thesi
     ensembl_pd = align.take_seqs(align.names)
     ensembl_alignment = align.to_dict()
     unaligned = align.degap()
-    if len(unaligned) != 2:
+    if unaligned.num_seqs != 2:
         raise ValueError("Alignment must contain exactly two sequences.")
     if len(unaligned.seqs[0]) == 0 or len(unaligned.seqs[1]) == 0:
         raise ValueError("Unaligned sequences must not be empty.") 
